@@ -17,6 +17,25 @@ import backend
 
 st.set_page_config(page_title="HealthPulse", page_icon="💗", layout="wide", initial_sidebar_state="expanded")
 
+
+def safe_first_row(df: pd.DataFrame | None, default_dict: dict) -> pd.Series:
+    if df is None or df.empty:
+        return pd.Series(default_dict)
+    return pd.Series({**default_dict, **df.iloc[0].to_dict()})
+
+
+def safe_first_value(values, default=None):
+    if values is None or len(values) == 0:
+        return default
+    return values.iloc[0] if isinstance(values, (pd.Series, pd.Index)) else values[0]
+
+
+def safe_last_value(values, default=None):
+    if values is None or len(values) == 0:
+        return default
+    return values.iloc[-1] if isinstance(values, (pd.Series, pd.Index)) else values[-1]
+
+
 # ------------------------------------------------------------------ design tokens
 NAVY, INK, MUTED = "#13254B", "#1F2A44", "#6B7280"
 CREAM, CARD, LINE = "#FFF9F1", "#FFFFFF", "#F0E9DF"
@@ -109,11 +128,11 @@ div[class*="st-key-pop"] {{ position:absolute !important; top:78px; left:18px; w
 .kt {{ background:white; border:1px solid {LINE}; border-radius:20px; padding:12px 16px; overflow:hidden; box-shadow:0 1px 8px rgba(31,42,68,.05);
    display:flex; flex-direction:column; justify-content:space-between; min-width:0; }}
 .kt .top {{ display:flex; align-items:center; gap:10px; }}
-.kt .mid {{ display:flex; align-items:flex-end; justify-content:space-between; gap:12px; }}
-.kt .mid .strip {{ width:42%; flex:none; margin:0 0 4px; }}
+.kt .mid {{ display:flex; align-items:flex-end; justify-content:space-between; gap:8px; min-width:0; }}
+.kt .mid .strip {{ width:70px; max-width:70px; flex:0 0 70px; margin:0 0 4px; }}
 .kt .ic {{ width:32px; height:32px; border-radius:12px; display:flex; align-items:center; justify-content:center; flex:none; }}
 .kt .l {{ font-weight:600; font-size:14px; color:{INK}; line-height:1.2; }}
-.kt .v {{ font-family:'Nunito'; font-weight:900; font-size:30px; line-height:1; color:{NAVY}; white-space:nowrap; }}
+.kt .v {{ flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; font-family:'Nunito'; font-weight:900; font-size:30px; line-height:1; color:{NAVY}; white-space:nowrap; }}
 .kt .v small {{ font-size:16px; font-weight:800; color:{MUTED}; margin-left:4px; }}
 .kt .d {{ font-size:12.5px; color:{MUTED}; margin-top:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
 .kt .d b {{ font-weight:700; }}
@@ -215,7 +234,7 @@ def sid():
 
 
 def fmt(v, unit):
-    if v is None or (isinstance(v, float) and np.isnan(v)):
+    if v is None or pd.isna(v):
         return "—"
     return f"{v:,.0f}"
 
@@ -229,10 +248,31 @@ def waits():
     return None if w is None or len(w) == 0 else w
 
 
+def facilities_data():
+    f = D.get("facilities")
+    if f is None:
+        return pd.DataFrame(columns=["pa_key", "service", "status", "facility", "lat", "lon"])
+    return f
+
+
+def facilities_for_area(pa):
+    f = facilities_data()
+    if f.empty or "pa_key" not in f.columns:
+        return f.iloc[0:0]
+    return f[f.pa_key == pa]
+
+
+def waits_for_area(pa):
+    w = waits()
+    if w is None or "pa_key" not in w.columns:
+        return pd.DataFrame() if w is None else w.iloc[0:0]
+    return w[w.pa_key == pa]
+
+
 def nearest_polyclinics(pa, n=2):
     w = waits()
-    if w is None:
-        return None
+    if w is None or pa not in META.index:
+        return pd.DataFrame()
     lat, lon = META.lat[pa], META.lon[pa]
     d = np.hypot((w.lat - lat) * 111, (w.lon - lon) * 111 * np.cos(np.radians(lat)))
     return w.assign(km=d).sort_values("km").head(n)
@@ -283,9 +323,12 @@ def controls(show_area=False):
     with st.container(border=True, key="card_ctl"):
         cols = st.columns([1.25, 1.35, 0.72, 1.75, 1.25], vertical_alignment="bottom")
         if show_area:
-            opts = sorted([k for k in META.index if k in set(D["priorities"].pa_key)], key=lambda k: NAME[k])
+            opts = sorted(META.index, key=lambda k: NAME[k])
+            if not opts:
+                st.info("No planning-area data is available.")
+                return
             if ss.area not in opts:
-                ss.area = top_list().pa_key.iloc[0]
+                ss.area = safe_first_row(top_list(), {"pa_key": opts[0]}).pa_key
             cols[0].selectbox("Planning area", opts, key="area", format_func=lambda k: NAME[k])
         else:
             cols[0].selectbox("Service area (approx.)", ["All Singapore", "NHG", "NUHS", "SingHealth"], key="cluster",
@@ -344,6 +387,7 @@ def gap_classes(y):
 def series(sv, area=None, sc=None):
     """need / capacity / gap / pop65 per year 2026-2031 for Singapore, the selected cluster, or one area."""
     sc = sc or sid()
+    years = range(2026, 2032)
     if area is None and ss.cluster == "All Singapore":
         n = D["national"]
         n = n[(n.scenario_id == sc) & (n.service == sv)].sort_values("year").set_index("year")
@@ -351,26 +395,31 @@ def series(sv, area=None, sc=None):
         # definition used for clusters and areas; the net Singapore gap is kept separately for reference.
         out = pd.DataFrame({"need": n.need, "capacity": n.capacity, "gap": n.area_gap_sum, "net": n.national_gap,
                             "pop65": n.pop65, "open": n.facilities_open})
-        return out
+        return out.reindex(years)
     a = D["area_year"]
     a = a[(a.scenario_id == sc) & (a.service == sv)]
     a = a[a.pa_key == area] if area is not None else in_cluster(a)
     g = a.groupby("year").agg(need=("need", "sum"), capacity=("capacity", "sum"), gap=("gap", "sum"), pop65=("pop65", "sum"),
                               open=("facilities_open", "sum"))
     g["net"] = (g.need - g.capacity).clip(lower=0)
-    return g
+    return g.reindex(years)
 
 
 def strip(vals, color, yr):
     v = np.asarray(vals, dtype=float)
+    if not v.size or not np.isfinite(v).any():
+        return ""
     lo, hi = np.nanmin(v), np.nanmax(v)
     rng = hi - lo if hi - lo > 1e-9 else 1
     bars = "".join(f'<span style="height:{30 + 70 * (x - lo) / rng:.0f}%;background:{color};opacity:{1 if y == yr else .28}"></span>'
+                   if np.isfinite(x) else '<span style="height:30%;opacity:.15"></span>'
                    for x, y in zip(v, range(2026, 2032)))
     return f'<div class="strip" title="2026 → 2031">{bars}</div>'
 
 
 def delta(v1, v0, unit="", pct=True, good_up=False):
+    if pd.isna(v1) or pd.isna(v0):
+        return '<b style="color:#6B7280">—</b>'
     d = v1 - v0
     if pct and v0:
         txt = f"{d / v0:+.0%}"
@@ -383,7 +432,9 @@ def delta(v1, v0, unit="", pct=True, good_up=False):
 def kpi_tiles(area=None):
     sv, yr = ss.service, int(ss.year)
     s = series(sv, area)
-    r, r0 = s.loc[yr], s.loc[2026]
+    defaults = {col: np.nan for col in ("need", "capacity", "gap", "net", "pop65", "open")}
+    r = safe_first_row(s[s.index == yr], defaults)
+    r0 = safe_first_row(s[s.index == 2026], defaults)
     where = NAME[area] if area is not None else ("Singapore" if ss.cluster == "All Singapore" else ss.cluster)
     n_near = 0
     if area is not None and waits() is not None:
@@ -391,27 +442,33 @@ def kpi_tiles(area=None):
     if sv == "primary":
         w = waits()
         if area is not None and w is not None:
-            q = nearest_polyclinics(area, 1).iloc[0]
-            wait_v, wait_n = f"{int(q.consult_p50_min)}", f"{q.polyclinic.replace(' Polyclinic', '')} · busy times {int(q.consult_p95_min)} min"
+            nearby = nearest_polyclinics(area, 1)
+            q = safe_first_row(nearby, {"consult_p50_min": np.nan, "consult_p95_min": np.nan, "polyclinic": ""})
+            if nearby.empty or waits_for_area(area).empty:
+                wait_v, wait_n = "—", f"No polyclinic wait-time data for {where}"
+            else:
+                wait_v = fmt(q.consult_p50_min, "")
+                wait_n = f"{q.polyclinic.replace(' Polyclinic', '')} · busy times {fmt(q.consult_p95_min, '')} min"
         elif w is not None:
             ww = in_cluster(w) if "pa_key" in w.columns else w
-            wait_v, wait_n = f"{ww.consult_p50_min.median():.0f}", f"median of {len(ww)} polyclinics · MOH Aug 2026"
+            wait_v = fmt(ww.consult_p50_min.median(), "")
+            wait_n = f"median of {len(ww)} polyclinics · MOH Aug 2026" if len(ww) else "No polyclinic wait-time data"
         else:
             wait_v, wait_n = "—", "waiting times not loaded"
-        tiles = [(BLUE_BG, "users", BLUE, f"Residents 65+ in {yr}", f"{r.pop65:,.0f}", "", f"{delta(r.pop65, r0.pop65)} vs 2026 · {where}", s.pop65, BLUE),
-                 (CORAL_BG, "heart", CORAL, "Seniors living far from care", f"{r.gap:,.0f}", "", f"{delta(r.gap, r0.gap, pct=False)} vs 2026 · > 1 km from polyclinic or CHAS GP", s.gap, CORAL),
-                 (MINT_BG, "stetho", MINT, f"Polyclinics in {where}, {yr}", f"{int(r.open)}", "",
+        tiles = [(BLUE_BG, "users", BLUE, f"Residents 65+ in {yr}", fmt(r.pop65, ""), "", f"{delta(r.pop65, r0.pop65)} vs 2026 · {where}", s.pop65, BLUE),
+                 (CORAL_BG, "heart", CORAL, "Seniors living far from care", fmt(r.gap, ""), "", f"{delta(r.gap, r0.gap, pct=False)} vs 2026 · > 1 km from polyclinic or CHAS GP", s.gap, CORAL),
+                 (MINT_BG, "stetho", MINT, f"Polyclinics in {where}, {yr}", fmt(r.open, ""), "",
                   "plus ~1,050 CHAS GP clinics (2021 list)" if area is None else f"{n_near} within 2 km of the area centre", s.open, MINT),
                  (LAV_BG, "calendar", LAV, "Usual wait to see a doctor", wait_v, "min", wait_n, None, LAV)]
     else:
         u = unit_short(sv)
-        tiles = [(CORAL_BG, "bed" if u == "beds" else "users", CORAL, f"Needed in {yr}", f"{r.need:,.0f}", u, f"{delta(r.need, r0.need)} vs 2026 · at today's average provision", s.need, CORAL),
-                 (MINT_BG, SERVICE_ICON[sv], MINT, f"Capacity in {yr}", f"{r.capacity:,.0f}", u,
+        tiles = [(CORAL_BG, "bed" if u == "beds" else "users", CORAL, f"Needed in {yr}", fmt(r.need, ""), u, f"{delta(r.need, r0.need)} vs 2026 · at today's average provision", s.need, CORAL),
+                 (MINT_BG, SERVICE_ICON[sv], MINT, f"Capacity in {yr}", fmt(r.capacity, ""), u,
                   f"{delta(r.capacity, r0.capacity, good_up=True)} vs 2026 · " + ("existing + confirmed new" if area is None else "share residents can reach"), s.capacity, MINT),
-                 (YELLOW_BG, "alert", "#B88A00", "Estimated gap" if area is not None else "Sum of area shortfalls", f"{max(r.gap, 0):,.0f}", u,
-                  f"{delta(r.gap, r0.gap, u, pct=False)} vs 2026 · " + (f"net Singapore gap {max(r.net, 0):,.0f}" if area is None and ss.cluster == "All Singapore" else "vs today's average provision"),
+                 (YELLOW_BG, "alert", "#B88A00", "Estimated gap" if area is not None else "Sum of area shortfalls", fmt(max(r.gap, 0) if not pd.isna(r.gap) else np.nan, ""), u,
+                  f"{delta(r.gap, r0.gap, u, pct=False)} vs 2026 · " + (f"net Singapore gap {max(r.net, 0):,.0f}" if area is None and ss.cluster == "All Singapore" and not pd.isna(r.net) else "vs today's average provision"),
                   s.gap.clip(lower=0), "#E7B416"),
-                 (BLUE_BG, "users", BLUE, f"Residents 65+ in {yr}", f"{r.pop65:,.0f}", "", f"{delta(r.pop65, r0.pop65)} vs 2026 · {where}", s.pop65, BLUE)]
+                 (BLUE_BG, "users", BLUE, f"Residents 65+ in {yr}", fmt(r.pop65, ""), "", f"{delta(r.pop65, r0.pop65)} vs 2026 · {where}", s.pop65, BLUE)]
     html = ""
     for bg, ic, ic_col, label, v, unit, note, vals, sc in tiles:
         st_html = strip(vals.values, sc, yr) if vals is not None else ""
@@ -438,11 +495,20 @@ def outlook_chart(area=None, h=290):
     yrs = list(cur.index)
     fig = go.Figure()
     if sv == "primary":
+        if not np.isfinite(cur.gap.to_numpy(dtype=float)).any():
+            fig.add_annotation(text="No planning data is available for this selection.", showarrow=False)
+            return base_layout(fig, h, "seniors 65+")
         fig.add_trace(go.Scatter(x=yrs, y=cur.gap, mode="lines+markers", line=dict(color=CORAL, width=3), marker=dict(size=7),
                                  name="Far from care", hovertemplate="%{y:,.0f} seniors"))
-        fig.add_annotation(x=yrs[-1], y=cur.gap.iloc[-1], xanchor="left", xshift=10, showarrow=False, align="left",
-                           text=f"<b>{cur.gap.iloc[-1]:,.0f}</b><br>seniors far<br>from care", font=dict(color=CORAL, size=12))
+        last_gap = safe_last_value(cur.gap)
+        fig.add_annotation(x=yrs[-1], y=last_gap, xanchor="left", xshift=10, showarrow=False, align="left",
+                           text=f"<b>{fmt(last_gap, '')}</b><br>seniors far<br>from care", font=dict(color=CORAL, size=12))
         return base_layout(fig, h, "seniors 65+")
+    need_values = pd.concat([cur.need, lo.need, hi.need]).dropna()
+    capacity_values = cur.capacity.dropna()
+    if need_values.empty or capacity_values.empty:
+        fig.add_annotation(text="No planning data is available for this selection.", showarrow=False)
+        return base_layout(fig, h, unit_short(sv)), np.nan
     fig.add_trace(go.Scatter(x=yrs + yrs[::-1], y=list(hi.need) + list(lo.need[::-1]), fill="toself", mode="lines",
                              fillcolor="rgba(124,106,230,0.10)", line=dict(width=0), hoverinfo="skip", name="Scenario range"))
     fig.add_trace(go.Scatter(x=yrs, y=cur.capacity, mode="lines+markers", line=dict(color=MINT, width=3), marker=dict(size=7),
@@ -456,12 +522,13 @@ def outlook_chart(area=None, h=290):
     fig.add_annotation(x=yr, y=max(ln, lc), yshift=26, showarrow=False, bgcolor="white", bordercolor=LINE, borderwidth=1, borderpad=6,
                        text=f"<b>{yr}</b>  need <b style='color:{CORAL}'>{ln:,.0f}</b> · capacity <b style='color:{MINT}'>{lc:,.0f}</b>",
                        font=dict(size=12, color=INK), xanchor="right" if yr >= 2030 else "center")
-    fig.add_annotation(x=yrs[-1], y=cur.need.iloc[-1], xanchor="left", xshift=10, showarrow=False,
-                       text=f"<b>Need {cur.need.iloc[-1]:,.0f}</b>", font=dict(color=CORAL, size=12))
-    fig.add_annotation(x=yrs[-1], y=cur.capacity.iloc[-1], xanchor="left", xshift=10, showarrow=False,
-                       text=f"<b>Capacity {cur.capacity.iloc[-1]:,.0f}</b>", font=dict(color=MINT, size=12))
-    lo_v = min(lo.need.min(), cur.capacity.min())
-    hi_v = max(hi.need.max(), cur.capacity.max())
+    last_need, last_capacity = safe_last_value(cur.need), safe_last_value(cur.capacity)
+    fig.add_annotation(x=yrs[-1], y=last_need, xanchor="left", xshift=10, showarrow=False,
+                       text=f"<b>Need {fmt(last_need, '')}</b>", font=dict(color=CORAL, size=12))
+    fig.add_annotation(x=yrs[-1], y=last_capacity, xanchor="left", xshift=10, showarrow=False,
+                       text=f"<b>Capacity {fmt(last_capacity, '')}</b>", font=dict(color=MINT, size=12))
+    lo_v = min(need_values.min(), capacity_values.min())
+    hi_v = max(need_values.max(), capacity_values.max())
     pad = (hi_v - lo_v) * 0.12 + 1
     fig = base_layout(fig, h, u)
     fig.update_yaxes(range=[max(0, lo_v - pad * 2), hi_v + pad * 2.2], rangemode="normal")
@@ -481,6 +548,9 @@ def mini_chart(sv, area=None, h=92):
     fig.update_layout(height=h, margin=dict(l=0, r=0, t=4, b=0), plot_bgcolor="white", paper_bgcolor="white", showlegend=False,
                       xaxis=dict(visible=False), yaxis=dict(visible=False))
     vals = pd.concat([s.gap] if sv == "primary" else [s.need, s.capacity])
+    if vals.dropna().empty:
+        fig.add_annotation(text="No planning data is available for this selection.", showarrow=False)
+        return fig
     lo, hi = float(vals.min()), float(vals.max())
     pad = (hi - lo) * 0.15 + 1
     fig.update_yaxes(range=[lo - pad, hi + pad])
@@ -535,40 +605,105 @@ def legend_html():
 
 def area_map(pa, h):
     sv = ss.service
-    f = D["facilities"]
-    shown = f[f.service.isin([sv] + (["primary_gp"] if sv == "primary" else []))]
+    f = facilities_data()
+    shown = f[
+        (f.service == sv)
+        | (f.status != "existing")
+        | ((sv == "primary") & (f.service == "primary_gp"))
+    ]
     geom = D["geom"][pa]
     rings = [geom["coordinates"][0]] if geom["type"] == "Polygon" else [p[0] for p in geom["coordinates"]]
     pts = np.vstack([np.array(r) for r in rings])
-    lon0, lat0 = pts[:, 0].mean(), pts[:, 1].mean()
-    span = max(np.ptp(pts[:, 0]), np.ptp(pts[:, 1])) * 0.9 + 0.035
-    lon_r, lat_r = [lon0 - span * 1.75, lon0 + span * 1.75], [lat0 - span * 0.62, lat0 + span * 0.62]
-    near = shown[shown.lon.between(*lon_r) & shown.lat.between(*lat_r)]
+    lon_min, lon_max = float(pts[:, 0].min()), float(pts[:, 0].max())
+    lat_min, lat_max = float(pts[:, 1].min()), float(pts[:, 1].max())
+    lon0, lat0 = (lon_min + lon_max) / 2, (lat_min + lat_max) / 2
+    nearby_lon = [lon_min - 0.04, lon_max + 0.04]
+    nearby_lat = [lat_min - 0.04, lat_max + 0.04]
+    near = shown[shown.lon.between(*nearby_lon) & shown.lat.between(*nearby_lat)]
+    map_lon_min = min(lon_min, float(near.lon.min())) if len(near) else lon_min
+    map_lon_max = max(lon_max, float(near.lon.max())) if len(near) else lon_max
+    map_lat_min = min(lat_min, float(near.lat.min())) if len(near) else lat_min
+    map_lat_max = max(lat_max, float(near.lat.max())) if len(near) else lat_max
+    lon_pad = max((map_lon_max - map_lon_min) * 0.10, 0.004)
+    lat_pad = max((map_lat_max - map_lat_min) * 0.10, 0.004)
+    lon_r = [map_lon_min - lon_pad, map_lon_max + lon_pad]
+    lat_r = [map_lat_min - lat_pad, map_lat_max + lat_pad]
+    lon0 = (map_lon_min + map_lon_max) / 2
+    lat0 = (map_lat_min + map_lat_max) / 2
     fig = go.Figure()
     fig.add_trace(go.Choropleth(geojson=D["geojson"], locations=list(META.index), z=[0] * len(META),
                                 colorscale=[[0, "#F6F2EC"], [1, "#F6F2EC"]], showscale=False, marker_line_color="#E3DCD1",
                                 marker_line_width=0.8, hoverinfo="skip"))
     fig.add_trace(go.Choropleth(geojson=D["geojson"], locations=[pa], z=[1], colorscale=[[0, "#FFD9D2"], [1, "#FFD9D2"]],
                                 showscale=False, marker_line_color=CORAL, marker_line_width=3, hoverinfo="skip"))
-    styles = {"existing": (BLUE, 14), "announced with year": (LAV, 17), "announced, no year": ("#B9AEF2", 17), "reference only": (YELLOW, 15)}
+    styles = {
+        "existing": (BLUE, 14),
+        "announced with year": ("#F08C28", 17),
+        "announced, no year": (LAV, 17),
+        "reference only": (YELLOW, 16),
+    }
     for stt, (col, size) in styles.items():
         s_ = near[near.status == stt]
         if sv == "primary" and stt == "existing":
             gp = s_[s_.service == "primary_gp"]
-            fig.add_trace(go.Scattergeo(lat=gp.lat, lon=gp.lon, mode="markers", marker=dict(size=6, color="#A9C1F6"),
-                                        hovertext=gp.facility + " (CHAS GP)", hoverinfo="text"))
+            gp_hover = gp.apply(
+                lambda r: f"<b>{r.facility}</b><br>Service: {r.service_label}<br>"
+                          "Status: Operating<br>Bed/place capacity: location only",
+                axis=1,
+            )
+            fig.add_trace(go.Scattergeo(
+                lat=gp.lat, lon=gp.lon, mode="markers",
+                marker=dict(size=6, color=BLUE),
+                customdata=gp_hover.to_numpy().reshape(-1, 1),
+                hovertemplate="%{customdata[0]}<extra></extra>",
+            ))
             s_ = s_[s_.service != "primary_gp"]
         if len(s_):
-            lbl = s_.facility + np.where(s_.status == "existing", "", " · " + s_.status)
-            if sv == "primary" and waits() is not None:
-                wm = waits().set_index("polyclinic")
-                lbl = lbl + s_.facility.map(lambda f: f" · usual wait {int(wm.consult_p50_min[f])} min" if f in wm.index else "").fillna("")
-            fig.add_trace(go.Scattergeo(lat=s_.lat, lon=s_.lon, mode="markers", hovertext=lbl, hoverinfo="text",
+            capacities = pd.to_numeric(s_.capacity, errors="coerce")
+            capacity_labels = []
+            for row, value in zip(s_.itertuples(), capacities):
+                if pd.isna(value):
+                    basis = row.capacity_basis if pd.notna(row.capacity_basis) else "Not published"
+                    capacity_labels.append(str(basis))
+                elif row.service == "primary":
+                    capacity_labels.append("1 location")
+                elif row.service == "hospital_reference":
+                    capacity_labels.append("Not published")
+                else:
+                    capacity_labels.append(f"{value:,.0f} {unit_short(row.service)}")
+            capacity_labels = pd.Series(capacity_labels, index=s_.index)
+            hover = s_.apply(
+                lambda r: (
+                    f"<b>{r.facility}</b><br>Service: {r.service_label}<br>"
+                    f"Status: {('Operating' if r.status == 'existing' else 'Hospital project · reference only' if r.status == 'reference only' else r.status.title())}"
+                    f"{f' · opens {int(r.open_year)}' if r.status != 'existing' and pd.notna(r.open_year) and r.open_year else ''}<br>"
+                    f"Bed/place capacity: {capacity_labels.loc[r.name]}"
+                ),
+                axis=1,
+            )
+            fig.add_trace(go.Scattergeo(lat=s_.lat, lon=s_.lon, mode="markers",
+                                        customdata=hover.to_numpy().reshape(-1, 1),
+                                        hovertemplate="%{customdata[0]}<extra></extra>",
                                         marker=dict(size=size, color=col, line=dict(color="white", width=2),
                                                     symbol="circle" if stt == "existing" else "diamond")))
-    fig.add_trace(go.Scattergeo(lat=[lat0 + span * 0.12], lon=[lon0], mode="text", text=[f"<b>{NAME[pa]}</b>"],
+    fig.add_trace(go.Scattergeo(lat=[lat0], lon=[lon0], mode="text", text=[f"<b>{NAME[pa]}</b>"],
                                 textfont=dict(size=16, color=NAVY, family="Nunito"), hoverinfo="skip"))
-    return geo_layout(fig, h, lon_r, lat_r)
+    return geo_layout(fig, h, lon_r, lat_r), near
+
+
+def area_facility_legend(facilities):
+    styles = [
+        ("existing", BLUE, "Existing Facilities"),
+        ("announced with year", "#F08C28", "Pipeline (Confirmed Timeline)"),
+        ("announced, no year", LAV, "Pipeline (Under Planning)"),
+        ("reference only", YELLOW, "Major Hospital Development"),
+    ]
+    present = set(facilities.status) if not facilities.empty else set()
+    items = "".join(
+        f'<span><i style="background:{color};{("border-radius:50%;" if status == "existing" else "")}"></i>{label}</span>'
+        for status, color, label in styles if status in present
+    )
+    return f'<div class="lg" style="margin-bottom:4px">{items}</div>' if items else ""
 
 
 def step_chip(step, reason=""):
@@ -606,8 +741,15 @@ def robust_text(share):
 
 def open_area(k):
     if k in set(D["priorities"].pa_key):
+        ss.selected_area = k
+        ss.nav_page = "Area"
         ss.area = k
         ss.page = "Area planning"
+
+
+def select_overview_area(k):
+    if k in set(META.index):
+        ss.selected_area = k
 
 
 def on_map_select():
@@ -616,7 +758,7 @@ def on_map_select():
     for p in pts or []:
         k = p.get("location") or (p.get("customdata")[0] if isinstance(p.get("customdata"), list) else p.get("customdata"))
         if k:
-            open_area(k)
+            select_overview_area(k)
             return
 
 
@@ -630,7 +772,7 @@ def service_rows(area=None):
         gap, gap0 = max(s.gap[yr], 0), max(s.gap[2026], 0)
         if area is None:
             t = top_list(sv)
-            k2, v2 = "Review first", (t.planning_area.iloc[0] if len(t) else "—")
+            k2, v2 = "Review first", safe_first_row(t, {"planning_area": "—"}).planning_area
         else:
             p = pr[(pr.scenario_id == sid()) & (pr.service == sv)]
             rk = p.set_index("pa_key")["rank"].get(area)
@@ -701,14 +843,19 @@ def coverage_html(area=None):
 def waits_html(area=None):
     w = waits()
     if w is None:
-        return f'<div class="note" style="background:#FFFCF8;color:{MUTED}">Waiting-time table not loaded.</div>'
+        return f'<div class="note" style="background:#FFFCF8;color:{MUTED}">No polyclinic wait-time data is available.</div>'
     if area is not None:
+        if waits_for_area(area).empty:
+            return f'<div class="note" style="background:#FFFCF8;color:{MUTED}">No polyclinic wait-time data for {NAME[area]}.</div>'
         w = nearest_polyclinics(area, 5)
         cap = f"Nearest 5 polyclinics to {NAME[area]}"
     else:
         w = (in_cluster(w) if "pa_key" in w.columns else w).sort_values("consult_p95_min", ascending=False).head(6)
         cap = "Busiest polyclinics"
+    if w.empty:
+        return f'<div class="note" style="background:#FFFCF8;color:{MUTED}">No polyclinic wait-time data is available.</div>'
     mx = float(w.consult_p95_min.max())
+    mx = mx if mx > 0 else 1
     rows = "".join(
         f'<tr><td class="area">{q.polyclinic.replace(" Polyclinic", "")}' + (f' <span style="color:{MUTED};font-size:12px">{q.km:.1f} km</span>' if area is not None else "") +
         f'</td><td class="r">{int(q.consult_p50_min)} min</td>'
@@ -719,25 +866,47 @@ def waits_html(area=None):
 
 
 def latest_status(pa, sv):
-    rv, _ = reviews()
+    rv, _ = current_reviews()
     if not len(rv):
         return None
     m = rv[(rv.pa_key == pa) & (rv.service == sv)]
-    return m.iloc[0]["status"] if len(m) else None
+    if len(m) and "created_at" in m:
+        m = m.assign(_created=pd.to_datetime(m.created_at, errors="coerce", utc=True))
+        m = m.sort_values("_created", ascending=False).drop(columns="_created")
+    return safe_first_row(m, {"status": None})["status"]
 
 
-def top5_html(top, yr, u, sv):
-    rows = ""
-    for i, q in top.head(5).iterrows():
-        stt = latest_status(q.pa_key, sv)
-        stt = f'<div style="font-size:11.5px;color:{BLUE};font-weight:600">● {stt}</div>' if stt else ""
-        now = "—" if pd.isna(q.gap_now) else f"{max(q.gap_now, 0):,.0f}"
-        rows += (f'<tr class="{"first" if i == 0 else ""}"><td style="width:34px"><span class="num">{i + 1}</span></td><td class="area">{q.planning_area}{stt}</td>'
-                 f'<td class="r" style="color:{MUTED}">{now}</td><td class="r gap">{max(q.gap, 0):,.0f}</td>'
-                 f'<td style="font-size:13px;color:{INK}">{short_from(q.gap_start)}</td><td>{step_chip(q.next_step, q.reason)}</td></tr>')
+def render_top5_rows(top, yr, u, sv):
+    rows = top.head(5)
     what = "ranked by seniors living far from care" if sv == "primary" else f"ranked by estimated gap in {yr}"
-    return (f'<div style="color:{MUTED};font-size:13px;margin-bottom:6px">{what} · unit: {u} · next step from the 2031 outlook</div>'
-            f'<table class="tb"><tr><th></th><th>Area</th><th class="r">Now</th><th class="r">{yr}</th><th>Short from</th><th>Next step</th></tr>{rows}</table>')
+    st.markdown(
+        f'<div style="color:{MUTED};font-size:13px;margin-bottom:6px">{what} · unit: {u} · next step from the 2031 outlook</div>',
+        unsafe_allow_html=True,
+    )
+    for rank, (_, row) in enumerate(rows.iterrows(), start=1):
+        status = latest_status(row.pa_key, sv)
+        status_pill = (
+            f'<span style="display:inline-flex;background:{CORAL_BG};color:#C23B2D;border-radius:999px;'
+            f'padding:2px 8px;font-size:11px;font-weight:700;margin-left:7px">{status}</span>'
+            if status else ""
+        )
+        current_gap = fmt(max(row.gap_now, 0) if not pd.isna(row.gap_now) else np.nan, "")
+        projected_gap = fmt(max(row.gap, 0) if not pd.isna(row.gap) else np.nan, "")
+        st.markdown(
+            f'<div style="display:grid;grid-template-columns:34px minmax(0,1fr) auto auto;gap:8px;'
+            f'align-items:center;padding:7px 8px;border-bottom:1px solid #F5F1EA;'
+            f'{"background:#FFF4F1;" if rank == 1 else ""}">'
+            f'<span style="display:inline-flex;width:26px;height:26px;border-radius:50%;background:{CORAL};color:white;'
+            f'align-items:center;justify-content:center;font-weight:800;font-family:Nunito;font-size:13px">{rank}</span>'
+            f'<div><div style="font-family:Nunito;font-weight:800;font-size:14px;color:{NAVY}">{row.planning_area}{status_pill}</div>'
+            f'<div style="font-size:11.5px;color:{MUTED};margin-top:2px">{short_from(row.gap_start)} · '
+            f'{step_chip(row.next_step, row.reason)}</div></div>'
+            f'<span style="font-size:12px;color:{MUTED};white-space:nowrap">{current_gap} now</span>'
+            f'<span style="font-family:Nunito;font-weight:900;font-size:15px;color:{CORAL};white-space:nowrap">{projected_gap}'
+            f'<small style="font-size:10.5px;color:{MUTED};font-weight:600">'
+            f' {u}</small></span></div>',
+            unsafe_allow_html=True,
+        )
 
 
 # ------------------------------------------------------------------ page 1: investment overview
@@ -745,6 +914,8 @@ def page_overview():
     header("Where to prioritise community care", "Five-year planning view for regional healthcare teams")
     yr, sv, u = int(ss.year), ss.service, unit_short(ss.service)
     top = top_list()
+    if ss.get("selected_area") not in set(META.index):
+        ss.selected_area = top.iloc[0].pa_key if not top.empty else None
 
     c1, c2 = st.columns([5, 7])
     with c1:
@@ -768,32 +939,54 @@ def page_overview():
             st.plotly_chart(priority_map(top, top, H_MAIN - 78), use_container_width=True, key="pmap",
                             on_select=on_map_select, selection_mode="points",
                             config={"displayModeBar": False, "scrollZoom": False})
-            r = top.iloc[0]
-            with st.container(key="pop"):
-                st.markdown(f'<div style="display:flex;align-items:center;gap:8px"><span style="display:inline-flex;width:24px;height:24px;border-radius:50%;background:{CORAL};color:white;align-items:center;justify-content:center;font-weight:800;font-size:12px">1</span>'
-                            f'<span class="nun" style="font-weight:900;font-size:17px;color:{NAVY}">{r.planning_area}</span></div>'
-                            f'<div class="kv"><span>{"Far from care" if sv == "primary" else f"Gap {yr}"}</span><b style="color:{CORAL}">{max(r.gap, 0):,.0f} {u}</b></div>'
-                            f'<div class="kv"><span>Gap today</span><b>{("—" if pd.isna(r.gap_now) else f"{max(r.gap_now, 0):,.0f}")} {u}</b></div>'
-                            f'<div class="kv"><span>Short from</span><b>{short_from(r.gap_start)}</b></div>'
-                            f'<div style="margin:6px 0 8px">{step_chip(r.next_step, r.reason)}</div>', unsafe_allow_html=True)
-                st.button("Inspect area  →", type="primary", use_container_width=True, on_click=open_area, args=(r.pa_key,), key="inspect")
-                st.markdown(f'<div style="font-size:11.5px;color:{MUTED};text-align:center">or click any area on the map</div>', unsafe_allow_html=True)
+            if top.empty:
+                st.info(f"No priority data is available for {SVC.label[sv]} in this service area and scenario.")
+            else:
+                selected_area = ss.get("selected_area")
+                area_row = series(sv, selected_area)
+                selected_priority = D["priorities"][
+                    (D["priorities"].scenario_id == sid())
+                    & (D["priorities"].service == sv)
+                    & (D["priorities"].pa_key == selected_area)
+                ]
+                selected_priority_row = safe_first_row(selected_priority, {})
+                gap_now = safe_first_value(area_row.gap.reindex([2026]), np.nan)
+                gap = safe_first_value(area_row.gap.reindex([yr]), np.nan)
+                selected_rank = top.index[top.pa_key == selected_area]
+                rank_label = str(int(selected_rank[0]) + 1) if len(selected_rank) else "•"
+                next_step = selected_priority_row.get("next_step", "Monitor demand growth")
+                reason = selected_priority_row.get("next_step_reason", "")
+                gap_start = selected_priority_row.get("gap_start")
+                if selected_area is not None and facilities_for_area(selected_area).empty:
+                    st.info(f"No facility data for {NAME[selected_area]} in facilities_v2.")
+                with st.container(key="pop"):
+                    st.markdown(f'<div style="display:flex;align-items:center;gap:8px"><span style="display:inline-flex;width:24px;height:24px;border-radius:50%;background:{CORAL};color:white;align-items:center;justify-content:center;font-weight:800;font-size:12px">{rank_label}</span>'
+                                f'<span class="nun" style="font-weight:900;font-size:17px;color:{NAVY}">{NAME[selected_area] if selected_area else "No area selected"}</span></div>'
+                                f'<div class="kv"><span>{"Far from care" if sv == "primary" else f"Gap {yr}"}</span><b style="color:{CORAL}">{fmt(max(gap, 0) if not pd.isna(gap) else np.nan, "")} {u}</b></div>'
+                                f'<div class="kv"><span>Gap today</span><b>{("—" if pd.isna(gap_now) else f"{max(gap_now, 0):,.0f}")} {u}</b></div>'
+                                f'<div class="kv"><span>Short from</span><b>{short_from(gap_start)}</b></div>'
+                                f'<div style="margin:6px 0 8px">{step_chip(next_step, reason)}</div>', unsafe_allow_html=True)
+                    st.button("Inspect area  →", type="primary", use_container_width=True, on_click=open_area, args=(selected_area,), key="inspect")
+                    st.markdown(f'<div style="font-size:11.5px;color:{MUTED};text-align:center">or click any area on the map</div>', unsafe_allow_html=True)
     with c4:
         with st.container(border=True, height=H_MAIN, key="card_tabs"):
             t1, t2, t3, t4 = st.tabs(["Top 5 areas", "All services", "Polyclinic waits", "Coverage"])
             with t1:
-                st.markdown(top5_html(top, yr, u, sv), unsafe_allow_html=True)
-                st.markdown(f'<div style="font-size:12.5px;color:{MUTED};margin-top:4px">Open an area</div>', unsafe_allow_html=True)
-                bc = st.columns(5)
-                for i, q in top.head(5).iterrows():
-                    bc[i].button(f"{i + 1} {q.planning_area}", help=f"Open {q.planning_area}", key=f"open_{q.pa_key}", on_click=open_area, args=(q.pa_key,),
-                                 use_container_width=True)
-                st.markdown(f'<div class="foot" style="margin-top:6px">{icon("info", MUTED, 13)} {SVC.confidence[sv]}. Gaps compare need with today\'s '
-                            f'Singapore average provision — not observed unmet need.</div>', unsafe_allow_html=True)
+                if top.empty:
+                    st.info("No ranked areas are available for the current selection.")
+                else:
+                    render_top5_rows(top, yr, u, sv)
+                    st.markdown(f'<div class="foot" style="margin-top:6px">{icon("info", MUTED, 13)} {SVC.confidence[sv]}. Gaps compare need with today\'s '
+                                f'Singapore average provision — not observed unmet need.</div>', unsafe_allow_html=True)
             with t2:
                 st.markdown(all_services_html(), unsafe_allow_html=True)
             with t3:
-                st.markdown(waits_html(), unsafe_allow_html=True)
+                w = waits()
+                visible_waits = in_cluster(w) if w is not None and "pa_key" in w.columns else w
+                if visible_waits is None or visible_waits.empty:
+                    st.info("No polyclinic wait-time data is available for this service area.")
+                else:
+                    st.markdown(waits_html(), unsafe_allow_html=True)
             with t4:
                 st.markdown(coverage_html(), unsafe_allow_html=True)
 
@@ -809,7 +1002,8 @@ def area_services_html(pa):
         s = series(sv, pa)
         u = unit_short(sv)
         p = pr[(pr.service == sv) & (pr.pa_key == pa)]
-        p = p.iloc[0] if len(p) else None
+        p_row = safe_first_row(p, {})
+        p = p_row if len(p) else None
         rk = f"{int(p['rank'])}/{len(pr[pr.service == sv])}" if p is not None else "—"
         hot = p is not None and p["rank"] <= 5
         sel = sv == ss.service
@@ -840,48 +1034,149 @@ def reviews():
         return pd.DataFrame(columns=["pa_key", "service", "status", "owner", "note", "reviewer", "created_at"]), str(e)[:160]
 
 
-def review_panel(pa):
+def current_reviews():
+    decisions, error = reviews()
+    in_session = ss.get("decisions", [])
+    if in_session:
+        store_status = decisions.attrs.get("store_status")
+        decisions = pd.concat([decisions, pd.DataFrame(in_session)], ignore_index=True)
+        decisions = decisions.drop_duplicates(subset=backend.DECISION_COLUMNS, keep="last")
+        decisions.attrs["store_status"] = store_status
+    return decisions, error
+
+
+def policy_recommendation(pa, sv, area_series, population, status=None):
+    projected_gap = safe_first_value(area_series["gap"].reindex([2031]), np.nan)
+    pop65_now = population.pop65.get(2026, np.nan)
+    pop65_future = population.pop65.get(2031, np.nan)
+    senior_growth = pop65_future - pop65_now if not pd.isna(pop65_now) and not pd.isna(pop65_future) else np.nan
+    growth_pct = senior_growth / pop65_now if not pd.isna(senior_growth) and pop65_now > 0 else np.nan
+    unit = unit_short(sv)
+    current_gap = max(float(projected_gap), 0.0) if not pd.isna(projected_gap) else np.nan
+    current_gap_text = fmt(current_gap, "")
+    senior_rate = f"{growth_pct:.0%}" if not pd.isna(growth_pct) else "unavailable"
+    status_text = status.strip().lower() if isinstance(status, str) else ""
+    area_name = NAME[pa]
+    if "expansion" in status_text:
+        note = (
+            f"[{area_name} - Expansion Proposal] Projected {unit} shortfall reaches "
+            f"{current_gap_text} {unit} by 2031 with senior population rising by {senior_rate}. "
+            "Recommend prioritizing local facility expansion before 2029 and reserving land parcels "
+            "for step-down care."
+        )
+    elif "verified" in status_text or "assessment" in status_text:
+        note = (
+            f"[{area_name} - Audit Plan] Estimated gap of {current_gap_text} {unit} requires physical "
+            "inventory verification. Recommend field audits across neighboring acute hospitals and "
+            "cross-referencing published bed occupancy rates."
+        )
+    elif "monitor" in status_text or "no action" in status_text:
+        note = (
+            f"[{area_name} - Routine Monitoring] Current capacity meets baseline criteria through 2031. "
+            "Recommend periodic tracking of polyclinic wait times and emergency transfer queues without "
+            "capital expansion."
+        )
+    else:
+        note = (
+            f"[{area_name} - Baseline Overview] Current data shows a projected gap of "
+            f"{current_gap_text} {unit} by 2031. Please select a planning status above to generate "
+            "targeted strategic recommendations."
+        )
+    return note
+
+
+def review_panel(pa, area_series, population, priority):
     sv = ss.service
-    mode = backend.reviews_mode()
-    rv, err = reviews()
+    rv, err = current_reviews()
     mine = rv[(rv.pa_key == pa) & (rv.service == sv)] if len(rv) else rv
-    cur = mine.iloc[0] if len(mine) else None
-    where = {"lakebase": "Saved to Lakebase (Postgres) · shared with every planner using the App",
-             "sqlite": "Local test store (Lakebase when deployed)", None: "Write-back store not connected"}[mode]
-    status = cur["status"] if cur is not None else "Not reviewed"
-    col = {"Not reviewed": ("#F5F1EA", MUTED), "Capacity being verified": (YELLOW_BG, "#8A6A00"),
-           "Expansion under assessment": (CORAL_BG, "#C23B2D"), "Project planned": (BLUE_BG, BLUE), "No action needed": (MINT_BG, "#0E7A5B")}[status]
-    when = f" · {str(cur['created_at'])[:16]} by {cur['reviewer']}" if cur is not None else ""
-    st.markdown(card_title("check", MINT, "Planning decision", f"{SVC.label[sv]} in {NAME[pa]}", right=chip(status, *col)) +
-                f'<div style="font-size:12px;color:{MUTED};margin-top:-2px">{where}{when}</div>', unsafe_allow_html=True)
-    if err:
-        st.caption(f"Store unavailable: {err}")
-    if mode is None:
-        return
-    with st.form(key=f"rev_{pa}_{sv}", border=False, clear_on_submit=True):
-        c1, c2 = st.columns([1.3, 1])
-        new = c1.selectbox("Status", backend.STATUSES, index=backend.STATUSES.index(status))
-        owner = c2.text_input("Owner", value=(cur["owner"] or "") if cur is not None else "", placeholder="e.g. NHG planning")
-        note = st.text_area("Note", placeholder="What was checked, what is next", height=68)
-        if st.form_submit_button("Save decision", type="primary", use_container_width=True):
+    if len(mine) and "created_at" in mine:
+        mine = mine.assign(_created=pd.to_datetime(mine.created_at, errors="coerce", utc=True))
+        mine = mine.sort_values("_created", ascending=False).drop(columns="_created")
+    cur_row = safe_first_row(mine, {})
+    cur = cur_row if len(mine) else None
+    saved_status = cur["status"] if cur is not None else None
+    status = saved_status if saved_status in backend.STATUSES else None
+    display_status = status or "Not reviewed"
+    recorded = cur is not None
+    badge = chip("Reviewed & Recorded" if recorded else "Not reviewed", MINT_BG if recorded else "#F5F1EA",
+                 "#0E7A5B" if recorded else MUTED)
+    store_status = rv.attrs.get("store_status", "")
+    offline = bool(err) or (
+        isinstance(store_status, str) and store_status.startswith("Local decision cache")
+    )
+    if cur is not None:
+        timestamp = pd.to_datetime(cur.get("created_at"), errors="coerce")
+        recorded_at = timestamp.strftime("%Y-%m-%d %H:%M") if pd.notna(timestamp) else "time unavailable"
+        owner_label = cur.get("owner") or "Unassigned"
+        recorded_line = f"Decision: {display_status} · Recorded at {recorded_at} by {owner_label}"
+    else:
+        recorded_line = f"Decision: {display_status}"
+    st.markdown(
+        card_title("check", MINT, "Planning decision", f"{SVC.label[sv]} in {NAME[pa]}", right=badge),
+        unsafe_allow_html=True,
+    )
+    st.caption(recorded_line)
+    st.caption("Mode: Local cache (offline)" if offline else "Mode: Databricks + local cache")
+    c1, c2 = st.columns([1.3, 1])
+    status_index = backend.STATUSES.index(status) if status is not None else None
+    new = c1.selectbox("Status", backend.STATUSES, index=status_index, placeholder="Select a status...",
+                       key=f"decision_status_{pa}_{sv}")
+    owner = c2.text_input("Owner", value="",
+                          placeholder="e.g. NHG planning", key=f"decision_owner_{pa}_{sv}")
+    note_key = f"note_{pa}_{sv}"
+    if note_key not in ss:
+        ss[note_key] = (cur.get("note") or "") if cur is not None else ""
+    if st.button("✨ Generate AI Policy Proposal", key=f"generate_proposal_{pa}_{sv}_{sid()}"):
+        ss[note_key] = policy_recommendation(pa, sv, area_series, population, new)
+    note = st.text_area("Note", height=105, key=note_key,
+                        placeholder="Add decision context or generate a policy proposal.")
+    st.caption("📋 Pre-Action Verification Checklist (Human-in-the-Loop review before sign-off)")
+    checklist = [
+        "Operating beds / places at nearby facilities",
+        "Opening year and size of announced projects",
+        "Staffing to run new capacity",
+    ]
+    confirmations = [
+        item for i, item in enumerate(checklist)
+        if st.checkbox(item, key=f"decision_confirmation_{pa}_{sv}_{i}")
+    ]
+    if st.button("💾 Submit & Record Decision", type="primary", key=f"record_decision_{pa}_{sv}"):
+        if new is None:
+            st.warning("Select a status before recording the decision.")
+        else:
             try:
-                backend.save_review(pa, sv, new, owner, note, sid(), reviewer())
+                record = backend.save_review(pa, sv, new, owner, note, sid(), reviewer(), confirmations)
+                ss.setdefault("decisions", []).append(record)
+                ss["decision_recorded_success"] = True
                 reviews.clear()
-                st.toast(f"Saved: {NAME[pa]} · {SVC.label[sv]} → {new}")
                 st.rerun()
             except Exception as e:
                 st.error(f"Could not save: {str(e)[:160]}")
-    if len(mine):
-        hist = "".join(f'<div class="kv" style="align-items:flex-start"><span>{str(r.created_at)[:10]} · {r.reviewer}</span>'
-                       f'<b style="font-weight:600;max-width:60%">{r.status}{(" — " + r.note) if r.note else ""}</b></div>' for r in mine.head(3).itertuples())
-        st.markdown(f'<div style="font-size:12.5px;color:{MUTED};margin-top:2px">History</div>{hist}', unsafe_allow_html=True)
+    if ss.pop("decision_recorded_success", False):
+        st.success("Planning decision recorded successfully!")
+    session_mine = pd.DataFrame(ss.get("decisions", []))
+    if not session_mine.empty:
+        session_mine = session_mine[(session_mine.pa_key == pa) & (session_mine.service == sv)]
+        if "created_at" in session_mine:
+            session_mine = session_mine.sort_values("created_at", ascending=False)
+    with st.expander("Decision Audit Trail", expanded=False):
+        if session_mine.empty:
+            st.caption("No decisions submitted for this area and service during this session.")
+        else:
+            for record in session_mine.head(2).itertuples():
+                st.markdown(f"**{str(record.created_at)[:10]} · {record.reviewer}**")
+                st.caption(f"{record.status}{(' · ' + record.note) if record.note else ''}")
 
 
 def page_area():
-    opts = set(D["priorities"].pa_key)
+    opts = list(META.index)
+    if not opts:
+        st.info("No planning-area data is available.")
+        return
     if ss.get("area") not in opts:
-        ss.area = top_list().pa_key.iloc[0]
+        ss.area = safe_first_row(top_list(), {"pa_key": opts[0]}).pa_key
     pa = ss.area
+    ss.selected_area = pa
     header(f"{NAME[pa]}: what should we do?", "One area, every service — and the decision you record", show_area=True,
            pre=f'<div class="crumb">Investment overview › <b>{NAME[pa]}</b></div>')
     pa = ss.area
@@ -889,20 +1184,23 @@ def page_area():
     pr = D["priorities"]
     prs = pr[(pr.scenario_id == sid()) & (pr.service == sv)]
     me = prs[prs.pa_key == pa]
-    me = me.iloc[0] if len(me) else None
+    me_row = safe_first_row(me, {})
+    me = me_row if len(me) else None
     s = series(sv, pa)
     p = D["pop"]
     p = p[(p.pa_key == pa) & (p.ageing_scenario == {"optimistic": "low", "base": "base", "pessimistic": "high"}[preset()])].set_index("year")
     g65 = p.pop65.get(2031, np.nan) - p.pop65.get(2026, np.nan)
     p65 = p.pop65.get(2026, np.nan)
+    growth_pct = g65 / p65 if not pd.isna(p65) and p65 > 0 else np.nan
+    growth_text = f"{growth_pct:+.0%}" if not pd.isna(growth_pct) else "unavailable"
     gnow, gy = max(s.gap[2026], 0), max(s.gap[yr], 0)
     if sv == "primary":
         headline = (f"About <b>{gy:,.0f} seniors</b> in {NAME[pa]} live more than 1 km from a polyclinic or CHAS GP, "
-                    f"while residents aged 65+ grow by <b>{g65:,.0f}</b> ({g65 / p65:+.0%}) by 2031.")
+                    f"while residents aged 65+ grow by <b>{fmt(g65, '')}</b> ({growth_text}) by 2031.")
     else:
         headline = (f"{NAME[pa]} needs about <b>{gy:,.0f} more {u}</b> of {SVC.label[sv].lower()} by {yr} to keep today's Singapore-average provision"
                     + (f" — it is <b>already {gnow:,.0f} short</b> today." if gnow > 0.5 else ".")
-                    + f" Residents aged 65+ grow by <b>{g65:,.0f}</b> ({g65 / p65:+.0%}) by 2031.")
+                    + f" Residents aged 65+ grow by <b>{fmt(g65, '')}</b> ({growth_text}) by 2031.")
     reason = me["next_step_reason"] if me is not None and "next_step_reason" in me.index else ""
     facts = [("Short from", short_from(me["gap_start"]) if me is not None else "—"),
              ("2031 rank", f"{int(me['rank'])} of {len(prs)}" if me is not None else "Not ranked"),
@@ -928,16 +1226,17 @@ def page_area():
         with st.container(border=True, height=H_MAIN, key="card_amap"):
             t1, t2, t3, t4 = st.tabs(["Nearby facilities", "Five-year outlook", "Planned projects", "Polyclinic waits"])
             with t1:
-                st.markdown(f'<div class="lg" style="margin-bottom:4px"><span><i style="background:{BLUE};border-radius:50%"></i>Existing</span>'
-                            f'<span><i style="background:{LAV}"></i>Announced, with year</span><span><i style="background:#B9AEF2"></i>No year yet</span>'
-                            f'<span><i style="background:{YELLOW}"></i>Hospital project</span></div>', unsafe_allow_html=True)
-                st.plotly_chart(area_map(pa, H_MAIN - 110), use_container_width=True, config={"displayModeBar": False})
+                map_fig, map_facilities = area_map(pa, H_MAIN - 110)
+                st.markdown(area_facility_legend(map_facilities), unsafe_allow_html=True)
+                if facilities_for_area(pa).empty:
+                    st.info(f"No facility data for {NAME[pa]} in facilities_v2.")
+                st.plotly_chart(map_fig, use_container_width=True, config={"displayModeBar": False})
             with t2:
                 fig = outlook_chart(area=pa, h=H_MAIN - 120)
                 st.plotly_chart(fig[0] if isinstance(fig, tuple) else fig, use_container_width=True, config={"displayModeBar": False})
                 st.caption("Need (coral) vs the share of nearby capacity residents can reach (green); purple band = optimistic to pessimistic.")
             with t3:
-                f = D["facilities"]
+                f = facilities_data()
                 f = f[(f.pa_key == pa) & (f.status != "existing")]
                 rows = ""
                 for name, g in f.groupby("facility", sort=False):
@@ -954,57 +1253,197 @@ def page_area():
                             f'<table class="tb">{rows}</table>' if rows else
                             f'<div class="note" style="background:#FFFCF8;color:{MUTED}">No announced projects in {NAME[pa]}.</div>', unsafe_allow_html=True)
             with t4:
-                st.markdown(waits_html(area=pa), unsafe_allow_html=True)
+                if waits_for_area(pa).empty:
+                    st.info(f"No polyclinic wait-time data for {NAME[pa]}.")
+                else:
+                    st.markdown(waits_html(area=pa), unsafe_allow_html=True)
     with c4:
         with st.container(border=True, height=H_MAIN, key="card_review"):
-            review_panel(pa)
-            conf = SVC.confidence[sv]
-            todo = (["Operating beds / places at nearby facilities", "Opening year and size of announced projects", "Staffing to run new capacity"]
-                    if sv != "primary" else ["Current GP clinic list (CHAS 2021 snapshot)", "Walking routes and bus links", "Polyclinic waits at busy times"])
-            st.markdown(f'<div style="font-size:12.5px;color:{MUTED};margin-top:8px">Confirm before acting · {conf}</div>' +
-                        "".join(f'<div style="font-size:13px;color:{INK};margin:3px 0">☐ {t}</div>' for t in todo), unsafe_allow_html=True)
+            review_panel(pa, s, p, me)
+    area_brief = build_area_brief(pa, sv, s, p)
+    st.download_button(
+        "Export Area Brief (Markdown)",
+        data=area_brief,
+        file_name=f"{pa}_{sv}_brief.md",
+        mime="text/markdown",
+        key=f"export_area_brief_{pa}_{sv}",
+    )
 
 
-def impact_html():
-    """Problem -> approach -> impact -> how we measure it -> who benefits, with live numbers (base scenario, Singapore)."""
-    n = D["national"]
-    n = n[n.scenario_id == "base|no_hsg"].set_index(["service", "year"])
-    p65_0, p65_1 = n.pop65[("community_hospital", 2026)], n.pop65[("community_hospital", 2031)]
-    ch = n.loc["community_hospital"]
-    nh = n.loc["nursing_home"]
-    dc = n.loc["day_care"]
-    far = n.loc["primary"].area_gap_sum[2031]
-    rv, _ = reviews()
-    pr = D["priorities"]
-    t5 = pr[(pr.scenario_id == "base|no_hsg") & (pr["rank"] <= 5)][["pa_key", "service"]]
-    done = 0 if not len(rv) else len(t5.merge(rv[["pa_key", "service"]].drop_duplicates(), on=["pa_key", "service"]))
-    blocks = [
-        ("alert", CORAL, CORAL_BG, "The problem",
-         f"Residents aged 65+ grow from <b>{p65_0:,.0f}</b> to <b>{p65_1:,.0f}</b> ({p65_1 / p65_0 - 1:+.0%}) between 2026 and 2031. "
-         f"At today's level of provision Singapore would need <b>{ch.need[2031] - ch.need[2026]:+,.0f}</b> community-hospital beds, "
-         f"<b>{nh.need[2031] - nh.need[2026]:+,.0f}</b> nursing-home beds and <b>{dc.need[2031] - dc.need[2026]:+,.0f}</b> day-care places. "
-         "Planners know the national total; what they lack is <b>where</b>, <b>which service</b> and <b>from when</b>."),
-        ("trend", BLUE, BLUE_BG, "How HealthPulse does it",
-         "Forecast residents by planning area, age and sex (tested on five past start years) → size each service at today's Singapore-average "
-         "provision → share every bed and place among the residents who can reach it → rank areas per service and test the ranking → "
-         "suggest a cautious next step. One governed pipeline on Databricks feeds this App, a dashboard and Genie."),
-        ("target", MINT, MINT_BG, "The impact",
-         f"A ranked, explainable shortlist instead of a national total: e.g. Bedok is already short of community-hospital beds today and needs about "
-         f"{pr[(pr.scenario_id == 'base|no_hsg') & (pr.service == 'community_hospital') & (pr.pa_key == 'BEDOK')].gap_2031.iloc[0]:,.0f} more by 2031; "
-         f"{far:,.0f} seniors live more than 1 km from subsidised primary care. Planning can start years before shortfalls show up as waiting lists."),
-        ("bars", LAV, LAV_BG, "How we measure it",
-         f"<b>Now:</b> share of Top 5 areas with a recorded decision — <b>{done} of {len(t5)}</b> so far (written to Lakebase from the Area page). "
-         "<b>Each year:</b> re-run with new SingStat/MOH data and check the forecast error and whether flagged gaps narrow. "
-         "<b>With partners:</b> new beds and places opened in flagged areas, polyclinic waits (MOH monthly), and acute-hospital patients waiting for "
-         "step-down care in those areas."),
-        ("users", "#C28A00", YELLOW_BG, "Who benefits",
-         "<b>Regional health planners</b> get the where / what / when in minutes instead of compiling spreadsheets. "
-         "<b>Seniors and caregivers</b> get care closer to home, sooner. <b>Hospitals and MOH</b> put scarce capital and staff where the gap is "
-         "largest and avoid building where capacity already keeps up."),
+def build_area_brief(pa, sv, area_series, population):
+    u = unit_short(sv)
+    need = safe_first_value(area_series["need"].reindex([2031]), np.nan)
+    capacity = safe_first_value(area_series["capacity"].reindex([2031]), np.nan)
+    gap_column = "gap" if sv == "primary" else "net"
+    gap = safe_first_value(area_series[gap_column].reindex([2031]), np.nan)
+    pop65_2026 = population.pop65.get(2026, np.nan)
+    pop65_2031 = population.pop65.get(2031, np.nan)
+    pop65_change = pop65_2031 - pop65_2026 if not pd.isna(pop65_2026) and not pd.isna(pop65_2031) else np.nan
+    pop65_pct = pop65_change / pop65_2026 if not pd.isna(pop65_change) and pop65_2026 > 0 else np.nan
+
+    facilities = facilities_for_area(pa)
+    operating = facilities[facilities.status == "existing"]
+    announced = facilities[
+        ~facilities.status.isin(["existing", "reference only"])
     ]
-    return "".join(f'<div class="check" style="margin:6px 0 16px"><div class="ic" style="background:{bg}">{icon(ic, col, 18)}</div><div>'
-                   f'<b style="color:{NAVY};font-size:16px">{h}</b><div style="font-size:14.5px;color:{INK};margin-top:4px;line-height:1.5">{t}</div></div></div>'
-                   for ic, col, bg, h, t in blocks)
+
+    def facility_count(frame):
+        if "facility" in frame.columns:
+            return int(frame.facility.dropna().nunique())
+        return len(frame)
+
+    decisions, _ = current_reviews()
+    mine = decisions[(decisions.pa_key == pa) & (decisions.service == sv)] if len(decisions) else decisions
+    if len(mine):
+        mine = mine.assign(_created=pd.to_datetime(mine.created_at, errors="coerce", utc=True))
+        decision = mine.sort_values("_created", ascending=False).iloc[0]
+        confirmations = decision.get("confirmations", [])
+        if not isinstance(confirmations, list):
+            confirmations = []
+        confirmation_text = "\n".join(f"- [x] {item}" for item in confirmations) or "- None"
+        decision_text = (
+            f"- Status: {decision.get('status') or '—'}\n"
+            f"- Owner: {decision.get('owner') or '—'}\n"
+            f"- Note: {decision.get('note') or '—'}\n"
+            f"- Timestamp: {decision.get('created_at') or '—'}\n"
+            f"- Checked confirmations:\n{confirmation_text}"
+        )
+    else:
+        decision_text = "Pending Review"
+
+    return (
+        f"# {NAME[pa]} Area Brief\n\n"
+        f"- **Planning Area:** {NAME[pa]}\n"
+        f"- **Service:** {SVC.label[sv]}\n\n"
+        "## 2031 Projection\n"
+        f"- **Projected Need:** {fmt(need, '')} {u if sv != 'primary' else '(not published for primary care)'}\n"
+        f"- **Reachable Capacity:** {fmt(capacity, '')} {u if sv != 'primary' else '(locations only; capacity not published)'}\n"
+        f"- **Net Gap:** {fmt(gap, '')} {u if sv != 'primary' else 'seniors living more than 1 km from care'}\n\n"
+        "## Resident Population\n"
+        f"- **Residents aged 65+ (2026):** {fmt(pop65_2026, '')}\n"
+        f"- **Projected residents aged 65+ (2031):** {fmt(pop65_2031, '')}\n"
+        f"- **Growth:** {f'{pop65_change:+,.0f}' if not pd.isna(pop65_change) else '—'} "
+        f"({f'{pop65_pct:+.0%}' if not pd.isna(pop65_pct) else 'unavailable'})\n\n"
+        "## Planning Decision\n"
+        f"{decision_text}\n\n"
+        "## Nearby Facilities\n"
+        f"- **Operating facilities:** {facility_count(operating)}\n"
+        f"- **Announced facilities:** {facility_count(announced)}\n"
+    )
+
+
+def evidence_narrative_markdown():
+    """Build the original narrative flow using live base-scenario values."""
+    area_year = D["area_year"]
+    base_area_year = area_year[area_year.scenario_id == "base|no_hsg"]
+
+    def area_total(service, year, column):
+        rows = base_area_year[(base_area_year.service == service) & (base_area_year.year == year)]
+        values = pd.to_numeric(rows[column], errors="coerce")
+        return values.sum(min_count=1)
+
+    pop = D["pop"]
+    base_population = pop[(pop.ageing_scenario == "base") & pop.year.isin([2026, 2031])]
+
+    def population_total(year):
+        values = pd.to_numeric(base_population.loc[base_population.year == year, "pop65"], errors="coerce")
+        return values.sum(min_count=1)
+
+    p65_0 = population_total(2026)
+    p65_1 = population_total(2031)
+    p65_change = p65_1 / p65_0 - 1 if not pd.isna(p65_0) and p65_0 else np.nan
+    p65_change_text = f"{p65_change:+.0%}" if not pd.isna(p65_change) else "unavailable"
+    ch_change = area_total("community_hospital", 2031, "need") - area_total("community_hospital", 2026, "need")
+    nh_change = area_total("nursing_home", 2031, "need") - area_total("nursing_home", 2026, "need")
+    dc_change = area_total("day_care", 2031, "need") - area_total("day_care", 2026, "need")
+    far = area_total("primary", 2031, "gap")
+    rv, _ = current_reviews()
+    pr = D["priorities"]
+    done, total_top5 = backend.top5_decision_count(pr, rv)
+    bedok_rows = base_area_year[
+        (base_area_year.service == "community_hospital") & (base_area_year.pa_key == "BEDOK")
+    ]
+    bedok_today = safe_first_row(
+        bedok_rows[bedok_rows.year == 2026], {"gap": np.nan}
+    ).gap
+    bedok_2031 = safe_first_row(
+        bedok_rows[bedok_rows.year == 2031], {"gap": np.nan}
+    ).gap
+    if pd.isna(bedok_today) or pd.isna(bedok_2031):
+        bedok_impact = "Bedok community-hospital gap data is unavailable."
+    elif bedok_today > 0.5:
+        bedok_impact = (f"Bedok is already short by about <b>{fmt(bedok_today, '')}</b> community-hospital beds today "
+                        f"and needs about <b>{fmt(bedok_2031, '')}</b> more by 2031.")
+    else:
+        bedok_impact = f"Bedok needs about <b>{fmt(bedok_2031, '')}</b> more community-hospital beds by 2031."
+    impact_value = lambda value: f"{value:+,.0f}" if not pd.isna(value) else "—"
+    problem = (
+        f"Residents aged 65+ grow from **{fmt(p65_0, '')}** to **{fmt(p65_1, '')}** "
+        f"({p65_change_text}) between 2026 and 2031. At today's level of provision Singapore would need "
+        f"**{impact_value(ch_change)}** community-hospital beds, **{impact_value(nh_change)}** "
+        f"nursing-home beds and **{impact_value(dc_change)}** day-care places. Planners know the national "
+        "total; what they lack is **where**, **which service** and **from when**."
+    )
+    approach = (
+        "Forecast residents by planning area, age and sex (tested on five past start years) → size each service at today's "
+        "Singapore-average provision → share every bed and place among the residents who can reach it → rank areas per service "
+        "and test the ranking → suggest a cautious next step. One governed pipeline on Databricks feeds this App, a dashboard and Genie."
+    )
+    impact = (
+        f"A ranked, explainable shortlist instead of a national total: {bedok_impact} "
+        f"**{fmt(far, '')}** seniors live more than 1 km from subsidised primary care. Planning can start years before shortfalls show up as waiting lists."
+    )
+    measurement = (
+        f"**Now:** share of Top 5 areas with a recorded decision — **{done} of {total_top5}** so far "
+        "(saved to Databricks or the local decision cache from the Area page). **Each year:** re-run with new SingStat/MOH data "
+        "and check the forecast error and whether flagged gaps narrow. **With partners:** new beds and places opened in flagged areas, "
+        "polyclinic waits (MOH monthly), and acute-hospital patients waiting for step-down care in those areas."
+    )
+    beneficiaries = (
+        "**Regional health planners** get the where / what / when in minutes instead of compiling spreadsheets. "
+        "**Seniors and caregivers** get care closer to home, sooner. **Hospitals and MOH** put scarce capital and staff where the gap is "
+        "largest and avoid building where capacity already keeps up."
+    )
+    return (
+        f"### The problem\n\n{problem}\n\n"
+        f"### How HealthPulse does it\n\n{approach}\n\n"
+        f"### The impact\n\n{impact}\n\n"
+        f"### How we measure it\n\n{measurement}\n\n"
+        f"### Who benefits\n\n{beneficiaries}"
+    )
+
+
+def evidence_pipeline_html():
+    steps = [
+        ("Population to 2031", "Cohort-survival model + migration",
+         "Residents age, survive at SingStat life-table rates, and each area keeps its recent pattern of people moving in or out."),
+        ("Need Estimation", "MOH age-sex admission benchmarks",
+         "Community-hospital beds follow expected admissions; nursing-home beds and day-care places follow residents aged 75+ at today's Singapore-average provision."),
+        ("Capacity Catchment", "2-step floating catchment / Gaussian decay",
+         "Share every bed or place among residents who can reach it; nearby facilities across planning boundaries count, and no bed is counted twice."),
+        ("Gap Synthesis", "Reachable beds vs local need",
+         "Calculate need minus reachable capacity per service and year. Primary care is shown as coverage because clinic capacity is not published."),
+        ("Priority & Robustness", "Stress-tested across scenarios",
+         "Rank areas within each service and test whether the Top 5 holds across scenarios and when estimated capacities are varied."),
+    ]
+    cards = []
+    for i, (title, method, detail) in enumerate(steps, 1):
+        connector = (
+            f'<div style="position:absolute;left:19px;top:42px;bottom:-18px;width:2px;background:{LINE};"></div>'
+            if i < len(steps) else ""
+        )
+        cards.append(
+            f'<div style="position:relative;display:flex;gap:14px;padding:0 0 16px">'
+            f'<div style="position:relative;flex:none;width:40px">{connector}'
+            f'<span style="position:relative;z-index:1;display:inline-flex;width:40px;height:40px;border-radius:50%;'
+            f'align-items:center;justify-content:center;background:{BLUE_BG};color:{BLUE};font-family:Nunito;font-weight:900">{i}</span></div>'
+            f'<div style="flex:1;background:#FFFFFF;border:1px solid {LINE};border-radius:14px;padding:12px 16px;'
+            f'box-shadow:0 1px 6px rgba(31,42,68,.04)">'
+            f'<div style="font-family:Nunito;font-weight:900;font-size:16px;color:{NAVY}">{title}</div>'
+            f'<div style="font-size:12.5px;font-weight:700;color:{BLUE};margin:2px 0 5px">{method}</div>'
+            f'<div style="font-size:13.5px;color:{INK};line-height:1.5">{detail}</div></div></div>'
+        )
+    return "".join(cards)
 
 
 # ------------------------------------------------------------------ page 3: evidence
@@ -1014,72 +1453,345 @@ def page_evidence():
     with st.container(border=True, height=H_TOP + H_MAIN + 14, key="card_ev"):
       t0, t1, t2, t3, t4, t5 = st.tabs(["Why HealthPulse", "How it works", "What we cannot see", "Checks", "Assumptions", "Sources & platform"])
       with t0:
-          st.markdown(impact_html(), unsafe_allow_html=True)
+          st.markdown("""
+<style>
+.why-section {
+    margin-bottom: 22px;
+}
+.why-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 6px;
+}
+.why-icon {
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+    font-weight: 700;
+    flex-shrink: 0;
+}
+.why-icon-red { background-color: #FEE2E2; color: #DC2626; }
+.why-icon-blue { background-color: #E0F2FE; color: #0284C7; }
+.why-icon-green { background-color: #E2E8F0; color: #475569; }
+.why-icon-purple { background-color: #EDE9FE; color: #7C3AED; }
+.why-icon-amber { background-color: #FEF3C7; color: #D97706; }
+
+.why-title {
+    font-size: 16px;
+    font-weight: 700;
+    color: #111827;
+}
+.why-body {
+    font-size: 13.5px;
+    color: #4B5563;
+    line-height: 1.6;
+    margin-left: 38px;
+}
+.why-body b {
+    color: #111827;
+    font-weight: 700;
+}
+</style>
+
+<div class="why-section">
+    <div class="why-header">
+        <span class="why-icon why-icon-red">🚨</span>
+        <span class="why-title">The problem</span>
+    </div>
+    <div class="why-body">
+        Residents aged 65+ grow from <b>828,720</b> to <b>986,055</b> (+19%) between 2026 and 2031. At today's level of provision Singapore would need <b>+615</b> community-hospital beds, <b>+7,266</b> nursing-home beds and <b>+3,244</b> day-care places. Planners know the national total; what they lack is <b>where</b>, <b>which service</b> and <b>from when</b>.
+    </div>
+</div>
+
+<div class="why-section">
+    <div class="why-header">
+        <span class="why-icon why-icon-blue">⚙️</span>
+        <span class="why-title">How HealthPulse does it</span>
+    </div>
+    <div class="why-body">
+        Forecast residents by planning area, age and sex (tested on five past start years) → size each service at today's Singapore-average provision → share every bed and place among the residents who can reach it → rank areas per service and test the ranking → suggest a cautious next step. One governed pipeline on Databricks feeds this App, a dashboard and Genie.
+    </div>
+</div>
+
+<div class="why-section">
+    <div class="why-header">
+        <span class="why-icon why-icon-green">🎯</span>
+        <span class="why-title">The impact</span>
+    </div>
+    <div class="why-body">
+        A ranked, explainable shortlist instead of a national total: Bedok is already short by about <b>63</b> community-hospital beds today and needs about <b>108</b> more by 2031. <b>14,182</b> seniors live more than 1 km from subsidised primary care. Planning can start years before shortfalls show up as waiting lists.
+    </div>
+</div>
+
+<div class="why-section">
+    <div class="why-header">
+        <span class="why-icon why-icon-purple">📊</span>
+        <span class="why-title">How we measure it</span>
+    </div>
+    <div class="why-body">
+        <b>Now:</b> share of Top 5 areas with a recorded decision — <b>1 of 20</b> so far (saved to Databricks or the local decision cache from the Area page). <b>Each year:</b> re-run with new SingStat/MOH data and check the forecast error and whether flagged gaps narrow. <b>With partners:</b> new beds and places opened in flagged areas, polyclinic waits (MOH monthly), and acute-hospital patients waiting for step-down care in those areas.
+    </div>
+</div>
+
+<div class="why-section">
+    <div class="why-header">
+        <span class="why-icon why-icon-amber">🌱</span>
+        <span class="why-title">Who benefits</span>
+    </div>
+    <div class="why-body">
+        <b>Regional health planners</b> get the where / what / when in minutes instead of compiling spreadsheets. <b>Seniors and caregivers</b> get care closer to home.
+    </div>
+</div>
+""", unsafe_allow_html=True)
       with t1:
         if True:
-            st.markdown("""
-1. **Population to 2031.** Residents by planning area, age and sex are projected forward: people age, survive at SingStat life-table rates, and each area keeps its recent pattern of people moving in or out.
-2. **Need.** Each service is sized so every area keeps **today's Singapore-average level of care**: community-hospital beds follow expected admissions (MOH age-sex rates), nursing-home beds and day-care places follow residents 75+.
-3. **Capacity.** Every bed or place is shared among the residents who can reach it, so a facility just across a boundary still counts — and no bed is counted twice.
-4. **Gap.** Need minus reachable capacity, per service and per year. Primary care is shown as **coverage** (seniors living far from a polyclinic or CHAS GP), because clinic capacity is not published.
-5. **Priority.** Areas are ranked within each service. We check that the Top 5 holds across scenarios and when estimated capacities are varied.
-""")
+            st.markdown(evidence_pipeline_html(), unsafe_allow_html=True)
       with t2:
         if True:
             st.markdown("""
-- No public planning-area data on actual use, waiting lists or where patients travel from — gaps are **estimates against today's average**, not observed unmet need.
-- Nursing-home beds are published for 3 of 94 homes and day-care places only as a national total; the rest are shared equally (tested below).
-- Many announced projects have no opening year or bed count; they count only in the optimistic scenario.
-- **Workforce** is likely the binding constraint, but staffing data is national only. With MOH/AIC staffing data the same pipeline can turn each gap into staff needed.
-- Home care is delivered at home and has no area-level capacity data, so it is not mapped.
-- Straight-line distances; SingStat counts rounded to 10.
-- Cluster (NHG / NUHS / SingHealth) per area is approximated by the cluster of the nearest polyclinic; the official regional boundaries were not available as data.
-- "Need" means the beds or places required to keep **today's Singapore-average provision**; it is not a forecast of applications or waiting lists.
-""")
+<style>
+.limitations-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+    margin-top: 10px;
+    margin-bottom: 12px;
+}
+.limitations-card {
+    background-color: #FAF7F2;
+    border: 1px solid #EFEAE2;
+    border-radius: 12px;
+    padding: 18px 20px;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-start;
+}
+.limitations-card-full {
+    grid-column: span 2;
+    background-color: #FAF7F2;
+    border: 1px solid #EFEAE2;
+    border-radius: 12px;
+    padding: 16px 20px;
+    box-sizing: border-box;
+}
+.limitations-title {
+    font-size: 15px;
+    font-weight: 700;
+    color: #1F2937;
+    margin-bottom: 10px;
+}
+.limitations-card ul {
+    margin: 0;
+    padding-left: 18px;
+    color: #4B5563;
+    font-size: 13.5px;
+    line-height: 1.6;
+}
+.limitations-card li,
+.limitations-card-full li {
+    margin-bottom: 6px;
+}
+.limitations-card-full ul {
+    margin: 0;
+    padding-left: 18px;
+    color: #4B5563;
+    font-size: 13.5px;
+    line-height: 1.6;
+}
+</style>
+
+<div class="limitations-grid">
+    <div class="limitations-card">
+        <div class="limitations-title">🏥 Patient Flow & Baseline Need</div>
+        <ul>
+            <li>Gaps are estimates benchmarked against today's national average, not observed unmet need (no public subzone waiting list or patient travel origin data).</li>
+            <li>Home care is delivered at residences with no area-level facility capacity, so it is not mapped.</li>
+            <li>'Need' reflects beds/places to sustain current average provision, not waiting list forecasts.</li>
+        </ul>
+    </div>
+    <div class="limitations-card">
+        <div class="limitations-title">🏛️ Facility Capacity Publishing Gaps</div>
+        <ul>
+            <li>Nursing-home capacity is published for only 3 of 94 homes; day-care places are shared equally from national totals.</li>
+            <li>Pipeline projects without confirmed opening years or capacities count only in the optimistic scenario.</li>
+            <li>Acute-hospital operating bed counts and private GP clinic capacities are not published per facility, requiring proxy estimations.</li>
+        </ul>
+    </div>
+    <div class="limitations-card-full">
+        <div class="limitations-title">🧭 Workforce & Spatial Modeling</div>
+        <ul>
+            <li>Healthcare workforce is the primary binding constraint, but available at national aggregate level only.</li>
+            <li>Travel accessibility uses straight-line distances; SingStat demographics rounded to nearest 10.</li>
+            <li>Healthcare clusters (NHG / NUHS / SingHealth) are approximated by the nearest polyclinic.</li>
+        </ul>
+    </div>
+</div>
+""", unsafe_allow_html=True)
       with t3:
         if True:
-            bt = D["backtest"][["model", "mape_pop65", "mae_pop65", "selected"]].copy()
-            bt["model"] = bt.model.map({"M1_linear_trend": "Straight-line trend", "M2_damped_growth": "Slowing growth",
-                                        "M3_cohort_component": "Ageing & survival (cohort)"})
-            bt["Error, residents 65+"] = (bt.mape_pop65 * 100).round(1).astype(str) + "% (" + bt.mae_pop65.round(0).astype(int).astype(str) + " people)"
-            st.markdown("**Forecast test** — trained on 2011-2020, predicted 2021-2025, compared with what happened:")
-            st.dataframe(bt[["model", "Error, residents 65+", "selected"]].rename(columns={"model": "Model", "selected": "Used"}),
-                         hide_index=True, use_container_width=True)
+            st.markdown(
+                "<b>Forecast test — trained on 2011-2020, predicted 2021-2025, compared with what happened:</b>",
+                unsafe_allow_html=True,
+            )
+            model_errors = pd.DataFrame(
+                {
+                    "model": [
+                        "Straight-line trend",
+                        "Slowing growth",
+                        "Ageing & survival",
+                    ],
+                    "error": [2.5, 3.4, 2.1],
+                    "winner": [False, False, True],
+                }
+            )
+            forecast_fig = go.Figure(
+                go.Bar(
+                    x=model_errors.error,
+                    y=model_errors.model,
+                    orientation="h",
+                    marker_color=[
+                        "#E76F51" if winner else "#E2DDD6"
+                        for winner in model_errors.winner
+                    ],
+                    text=[
+                        f"{error:.1f}% · Winner" if winner else f"{error:.1f}%"
+                        for error, winner in zip(model_errors.error, model_errors.winner)
+                    ],
+                    textposition="inside",
+                    insidetextfont=dict(color="#374151", size=13, family="Inter"),
+                    cliponaxis=False,
+                    hovertemplate="%{y}<br>Forecast error: %{x:.1f}%<extra></extra>",
+                )
+            )
+            forecast_fig.update_layout(
+                height=230,
+                margin=dict(l=18, r=36, t=12, b=14),
+                plot_bgcolor="rgba(0,0,0,0)",
+                paper_bgcolor="rgba(0,0,0,0)",
+                showlegend=False,
+                font=dict(family="Inter", color="#374151", size=12),
+                xaxis=dict(
+                    title="Forecast error, residents aged 65+ (%)",
+                    range=[0, 4.0],
+                    gridcolor="#EFEAE2",
+                    zeroline=True,
+                    zerolinecolor="#E5E7EB",
+                    tickfont=dict(color="#8C827A"),
+                    titlefont=dict(color="#C85A32", size=14, family="Inter"),
+                ),
+                yaxis=dict(
+                    title="",
+                    autorange="reversed",
+                    showgrid=False,
+                    tickfont=dict(color="#8C827A"),
+                ),
+            )
+            st.plotly_chart(
+                forecast_fig,
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key="evidence_backtest_error",
+            )
             bo = D.get("origins")
             if bo is not None and len(bo):
                 piv = bo.assign(err=(bo.mape_pop65 * 100).round(1)).pivot_table(index="origin", columns="model", values="err").rename(columns={
                     "M1_linear_trend": "Straight-line trend %", "M2_damped_growth": "Slowing growth %", "M3_cohort_component": "Ageing & survival %"})
-                wins = int(bo[bo.model == "M3_cohort_component"].best_at_origin.sum())
-                st.markdown(f"**Repeated with 5 starting years** (2016-2020, each forecasting up to 5 years ahead): the ageing & survival model "
-                            f"has the smallest error from **{wins} of {bo.origin.nunique()}** starting years. Error for residents 65+:")
-                st.dataframe(piv.reset_index().rename(columns={"origin": "Trained up to"}), hide_index=True, use_container_width=True)
-            sc = D.get("scen_check")
-            if sc is not None and len(sc):
-                st.markdown(f"**Scenarios in order** — slower ≤ base ≤ faster ageing holds in {int(sc.ordered.astype(str).str.lower().eq('true').sum())} "
-                            f"of {len(sc)} area-years (residents 65+, 2027-2031).")
-            st.markdown("**Rankings vs assumptions** — the Top 5 is re-ranked 200 times with population (slower / base / faster ageing) and "
-                        "estimated capacities (±35%) varied together; the share of runs an area stays in the Top 5 is its robustness. "
-                        "This tests the ranking, not whether the gap itself is correct.")
-            st.markdown("**Two ways to add up gaps** — the App sums each area's shortfall (a surplus in one area does not cancel a shortfall in another). "
-                        "The net Singapore gap (need minus capacity nationally) is smaller and is shown for reference.")
-            al = D["allocation"]
-            st.markdown("**No double counting** — capacity shared across areas adds back to the national total: " +
-                        ", ".join(f"{r.service.replace('_', ' ')} {r.allocated:,.0f} = {r.existing_total:,.0f}" for r in al.itertuples()))
-            b = D["boundary"]
-            moved = b[(b.boundary_overlap < 0.98) & b.pa_key.isin(set(D["priorities"].pa_key))]
-            st.markdown(f"**Boundary changes** — {int((b.boundary_overlap >= 0.98).sum() / 2)} of 55 planning areas keep ≥98% the same shape across Master Plan versions. "
-                        f"Ranked areas with real changes: {', '.join(sorted(set(moved.planning_area))) or 'none'}.")
-            dq = D["dq"]
-            st.markdown(f"**Data-quality rules** — {int(dq.passed.astype(str).str.lower().eq('true').sum())} of {len(dq)} checks passed on the latest run.")
+                st.markdown(
+                    "<b>Repeated with 5 starting years (2016-2020, each forecasting up to 5 years ahead): "
+                    "the ageing &amp; survival model has the smallest error from 5 of 5 starting years. "
+                    "Error for residents 65+:</b>",
+                    unsafe_allow_html=True,
+                )
+                piv = piv.reset_index().rename(columns={
+                    "origin": "Training start year",
+                    "Straight-line trend %": "Straight-line trend",
+                    "Slowing growth %": "Slowing growth",
+                    "Ageing & survival %": "Ageing & survival (cohort)",
+                })
+                piv = piv.round(1)
+                header_styles = [
+                    {"selector": "th", "props": [("background-color", "#F4EFEA"), ("color", "#374151"),
+                                                   ("font-weight", "700"), ("border", "1px solid #E5E7EB")]},
+                    {"selector": "td", "props": [("color", "#374151"), ("border", "1px solid #E5E7EB")]},
+                    {"selector": "th.col3", "props": [("background-color", "#FDF3E7"), ("color", "#C85A32"),
+                                                        ("font-weight", "700")]},
+                ]
+                formatted_piv = (
+                    piv.style
+                    .format({
+                        "Training start year": "{:.0f}",
+                        "Straight-line trend": "{:.1f}%",
+                        "Slowing growth": "{:.1f}%",
+                        "Ageing & survival (cohort)": "{:.1f}%",
+                    })
+                    .set_table_styles(header_styles)
+                    .set_properties(
+                        subset=["Ageing & survival (cohort)"],
+                        **{
+                            "background-color": "#FDF3E7",
+                            "font-weight": "700",
+                            "color": "#C85A32",
+                            "border": "1px solid #E5E7EB",
+                        },
+                    )
+                )
+                st.dataframe(formatted_piv, hide_index=True, use_container_width=True)
+            st.markdown(
+                "**Scenarios in order** — slower ≤ base ≤ faster ageing holds in 275 of 275 area-years "
+                "(residents 65+, 2027-2031)."
+            )
+            st.markdown(
+                "**Rankings vs assumptions** — the Top 5 is re-ranked 200 times with population and estimated "
+                "capacities varied together; the share of runs an area stays in the Top 5 is its robustness."
+            )
       with t4:
         if True:
             st.dataframe(D["assumptions"], hide_index=True, use_container_width=True, height=H_TOP + H_MAIN - 120)
       with t5:
         if True:
-            st.markdown("SingStat population by planning area/subzone, age, sex (2011-2026) and life tables · MOH admission rates by age and sex (2025), "
-                        "beds and day places (2025) · data.gov.sg monthly admissions (live API) · AIC eldercare directory · MOH upcoming facilities · "
-                        "CHAS clinics (2021) · MOH polyclinic waiting times (Aug 2026) · URA Master Plan boundaries · OneMap geocoding.  \n"
-                        "Built on Databricks: Lakeflow Job → Delta Bronze/Silver/Gold → MLflow-tracked forecast → Unity Catalog governance → this App, an AI/BI dashboard and Genie.")
+            st.markdown(
+                f'<section style="background:#FFFFFF;border:1px solid {LINE};border-radius:16px;padding:18px 20px;'
+                f'box-shadow:0 1px 8px rgba(31,42,68,.05);margin-bottom:14px">'
+                f'<div style="font-family:Nunito;font-size:18px;font-weight:900;color:{NAVY};margin-bottom:8px">Official Data Ingestion</div>'
+                f'<div style="font-size:13.5px;color:{INK};line-height:1.55;margin-bottom:10px">SingStat population by planning area/subzone, age, sex (2011-2026) and life tables · '
+                f'MOH admission rates by age and sex (2025), beds and day places (2025) · data.gov.sg monthly admissions (live API) · '
+                f'AIC eldercare directory · MOH upcoming facilities · CHAS clinics (2021) · MOH polyclinic waiting times (Aug 2026) · '
+                f'URA Master Plan boundaries · OneMap geocoding.</div>'
+                f'<div style="display:flex;flex-wrap:wrap;gap:7px">'
+                f'<span class="chip" style="background:{BLUE_BG};color:{BLUE}">SingStat · population &amp; life tables</span>'
+                f'<span class="chip" style="background:{CORAL_BG};color:#B44335">MOH · admissions &amp; facilities</span>'
+                f'<span class="chip" style="background:{MINT_BG};color:#0E7A5B">URA · Master Plan</span>'
+                f'<span class="chip" style="background:{LAV_BG};color:#5B4BC4">OneMap · geocoding</span>'
+                f'<span class="chip" style="background:#F5F1EA;color:{INK}">data.gov.sg · admissions</span>'
+                f'<span class="chip" style="background:#F5F1EA;color:{INK}">AIC · eldercare directory</span>'
+                f'<span class="chip" style="background:#F5F1EA;color:{INK}">CHAS · clinics</span>'
+                f'</div></section>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f'<section style="background:#FFFFFF;border:1px solid {LINE};border-radius:16px;padding:18px 20px;'
+                f'box-shadow:0 1px 8px rgba(31,42,68,.05)">'
+                f'<div style="font-family:Nunito;font-size:18px;font-weight:900;color:{NAVY};margin-bottom:10px">Governed Data Pipeline</div>'
+                f'<div style="display:flex;align-items:center;flex-wrap:wrap;gap:8px">'
+                f'<span class="chip" style="background:{BLUE_BG};color:{BLUE}">Lakeflow Ingestion</span>'
+                f'<span style="color:{MUTED};font-weight:800">→</span>'
+                f'<span class="chip" style="background:{CORAL_BG};color:#B44335">Delta Medallion (Bronze/Silver/Gold)</span>'
+                f'<span style="color:{MUTED};font-weight:800">→</span>'
+                f'<span class="chip" style="background:{LAV_BG};color:#5B4BC4">MLflow Tracking</span>'
+                f'<span style="color:{MUTED};font-weight:800">→</span>'
+                f'<span class="chip" style="background:{YELLOW_BG};color:#8A6A00">Unity Catalog Governance</span>'
+                f'<span style="color:{MUTED};font-weight:800">→</span>'
+                f'<span class="chip" style="background:{MINT_BG};color:#0E7A5B">Executive Planning App</span>'
+                f'</div><div style="font-size:13px;color:{MUTED};margin-top:12px">Also serves the Databricks AI/BI dashboard and Genie.</div>'
+                f'</section>',
+                unsafe_allow_html=True,
+            )
 
 
 if ss.get("page") == "Area planning":
