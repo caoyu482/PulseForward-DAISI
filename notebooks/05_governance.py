@@ -43,8 +43,8 @@ display(spark.table(f"{S}.planner_entitlements"))
 
 spark.sql(f"""CREATE OR REPLACE FUNCTION {S}.cluster_row_filter(pa STRING)
 RETURNS BOOLEAN
-COMMENT 'Row filter: caller sees a planning area if entitled to ALL or to the cluster serving that area.'
-RETURN EXISTS (
+COMMENT 'Row filter: workspace admins see every area; other callers see a planning area if entitled to ALL or to the cluster serving it.'
+RETURN is_member('admins') OR EXISTS (
   SELECT 1 FROM {S}.planner_entitlements e
   LEFT JOIN {G}.planning_area_meta m ON m.pa_key = pa
   WHERE e.principal = current_user() AND (e.cluster = 'ALL' OR e.cluster = m.cluster))""")
@@ -63,6 +63,7 @@ spark.sql(f"""CREATE OR REPLACE FUNCTION {S}.small_cell_mask(v INT)
 RETURNS INT
 COMMENT 'Column mask: hide counts below 20 unless the caller may see small cells.'
 RETURN CASE WHEN v IS NULL OR v >= 20 THEN v
+            WHEN is_member('admins') THEN v
             WHEN EXISTS (SELECT 1 FROM {S}.planner_entitlements e WHERE e.principal = current_user() AND e.can_see_small_cells) THEN v
             ELSE NULL END""")
 for col in ["pop_65_74", "pop_75_84", "pop_85plus"]:
